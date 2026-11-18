@@ -1,0 +1,16 @@
+back = tab
+start = esc
+a = mouse_left
+b = mouse_right
+x = enter
+y = space
+l1 = pageup
+r1 = pagedown
+l2 = left
+r2 = right
+up = insert
+down = f6
+left = pause
+right = menu
+mouse_scale = 512
+mouse_delay = 16

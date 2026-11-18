@@ -1,0 +1,15 @@
+# gptokeyb (versión antigua de la RG35XX). Night Shift (prototipo)
+# En la RG35XX los nombres a/b de gptokeyb van cruzados respecto a los botones físicos:
+# por eso A y B saltan los dos. X = usar herramienta, L1/R1 = cambiar de herramienta.
+up = up
+down = down
+left = left
+right = right
+a = z
+b = z
+x = c
+l1 = pageup
+r1 = pagedown
+y = m
+back = tab
+start = esc

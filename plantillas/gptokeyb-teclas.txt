@@ -1,0 +1,17 @@
+Teclas que entiende el gptokeyb ANTIGUO (christianhaitian/gptokeyb) de la RG35XX:
+
+Especiales: up down left right space esc end home shift leftshift rightshift
+            ctrl leftctrl rightctrl alt leftalt rightalt backspace enter
+            pageup pagedown insert delete capslock tab pause menu
+Letras:     a .. z
+Números:    1 .. 0
+Función:    f1 .. f10        (NO hay f11 ni f12)
+Símbolos:   @ # € % & * - + ( ) ! ' : ; / ? . , ~ ` | { } $ ^ _ = [ ] \ < >
+Ratón:      mouse_left mouse_right  mouse_movement_up/down/left/right
+NO existen: numpad0..numpad9 (solo en la versión nueva de PortsMaster)
+
+Botones del mando que se pueden asignar:
+  a b x y  l1 r1 l2 r2  start back(select) guide  up down left right
+
+Truco usado en OpenXcom: para que el propio juego reciba la cruceta como teclas
+"raras" que no use para nada, se mapeó up=insert down=f6 left=pause right=menu.

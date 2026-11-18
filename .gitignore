@@ -1,0 +1,4 @@
+/sysroot/
+*.7z
+*.tar.gz
+_to_delete*/

@@ -1,0 +1,981 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7ddee1714..beb3ff1ae 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -61,7 +61,7 @@ if ( IS_DIRECTORY ${DEPS_DIR}/include )
+    set ( SDLIMAGE_LIBRARY SDL_image )
+    set ( YAMLCPP_LIBRARY yaml-cpp )
+    set ( YAMLCPP_LIBRARY_DEBUG yaml-cppd )
+-   add_definitions( -DYAML_CPP_DLL )
++   # removed for static yaml-cpp
+ else ( )
+   find_package ( SDL2 COMPONENTS mixer gfx image)
+   find_package ( Yaml_cpp 0.5.3)
+diff --git a/src/Engine/Game.cpp b/src/Engine/Game.cpp
+index 96f4d9e7c..dce6b2bc0 100644
+--- a/src/Engine/Game.cpp
++++ b/src/Engine/Game.cpp
+@@ -20,6 +20,7 @@
+ #include "../resource.h"
+ #include <algorithm>
+ #include <cmath>
++#include <cstdlib>
+ #include <sstream>
+ #include <SDL_mixer.h>
+ #include "State.h"
+@@ -40,6 +41,13 @@
+ #include "FileMap.h"
+ #include "Unicode.h"
+ #include "../Menu/TestState.h"
++#include "InteractiveSurface.h"
++#include "../Interface/TextList.h"
++#include "../Interface/ArrowButton.h"
++#include "../Interface/Text.h"
++#include "../Interface/TextEdit.h"
++#include "Font.h"
++#include <cstring>
+ 
+ namespace OpenXcom
+ {
+@@ -140,6 +148,731 @@ Game::~Game()
+  * active state, running any code within and blitting all the states and
+  * cursor to the screen. This is run indefinitely until the game quits.
+  */
++
++// ---------------------------------------------------------------------------
++// On-screen keyboard (handhelds). Opens by itself when a text field gets the
++// focus, or with L1+R1. D-pad picks a key, A types it, B deletes, X = Enter,
++// Start closes it. Drawn see-through (dithered) over the game.
++// ---------------------------------------------------------------------------
++namespace OSK
++{
++	enum Special { K_CHAR = 0, K_SHIFT, K_SPACE, K_LEFT, K_RIGHT, K_DEL, K_OK };
++	struct Key { std::string low, up; UCode cLow, cUp; Special sp; int units; int x, y, w, h; Text *txt; std::string shown; };
++
++	static bool visible = false, autoOpened = false, wasFocused = false, shift = true, built = false;
++	static std::vector<std::vector<Key> > rows;
++	static int selRow = 1, selCol = 0;
++	static int heldDir = -1;
++	static Uint32 heldSince = 0, lastRep = 0;
++	static int originX = 0, originY = 0, totalW = 0, totalH = 0;
++	static bool atTop = false;
++	static Game *game = 0;
++	static const int KH = 13, UNIT = 26, PAD = 3;
++
++	static Key mk(const std::string &l, const std::string &u, UCode cl, UCode cu, Special sp = K_CHAR, int units = 1)
++	{
++		Key k; k.low = l; k.up = u; k.cLow = cl; k.cUp = cu; k.sp = sp; k.units = units; k.x = k.y = k.w = k.h = 0; k.txt = 0;
++		return k;
++	}
++
++	static void addChars(std::vector<Key> &row, const char *lo, const char *hi)
++	{
++		for (size_t i = 0; lo[i]; ++i)
++		{
++			row.push_back(mk(std::string(1, lo[i]), std::string(1, hi[i]), (UCode)(unsigned char)lo[i], (UCode)(unsigned char)hi[i]));
++		}
++	}
++
++	static void build()
++	{
++		if (built) return;
++		built = true;
++		rows.resize(5);
++		addChars(rows[0], "1234567890-", "!?#$%&/()=_");
++		addChars(rows[1], "qwertyuiop", "QWERTYUIOP");
++		addChars(rows[2], "asdfghjkl", "ASDFGHJKL");
++		rows[2].push_back(mk("\xC3\xB1", "\xC3\x91", 0xF1, 0xD1));
++		addChars(rows[3], "zxcvbnm,.'", "ZXCVBNM;:\"");
++		rows[4].push_back(mk("Mayus", "Mayus", 0, 0, K_SHIFT, 2));
++		rows[4].push_back(mk("Espacio", "Espacio", ' ', ' ', K_SPACE, 4));
++		rows[4].push_back(mk("<", "<", 0, 0, K_LEFT, 1));
++		rows[4].push_back(mk(">", ">", 0, 0, K_RIGHT, 1));
++		rows[4].push_back(mk("Borrar", "Borrar", 0, 0, K_DEL, 2));
++		rows[4].push_back(mk("OK", "OK", 0, 0, K_OK, 2));
++	}
++
++	static void layout()
++	{
++		int maxUnits = 0;
++		for (size_t r = 0; r < rows.size(); ++r)
++		{
++			int u = 0;
++			for (size_t c = 0; c < rows[r].size(); ++c) u += rows[r][c].units;
++			maxUnits = std::max(maxUnits, u);
++		}
++		totalW = maxUnits * UNIT + PAD * 2;
++		totalH = (int)rows.size() * (KH + 1) + PAD * 2 - 1;
++		originX = (Options::baseXResolution - totalW) / 2;
++		originY = atTop ? 2 : Options::baseYResolution - totalH - 2;
++		for (size_t r = 0; r < rows.size(); ++r)
++		{
++			int u = 0;
++			for (size_t c = 0; c < rows[r].size(); ++c) u += rows[r][c].units;
++			int x = originX + PAD + (maxUnits - u) * UNIT / 2;
++			for (size_t c = 0; c < rows[r].size(); ++c)
++			{
++				Key &k = rows[r][c];
++				k.x = x; k.y = originY + PAD + (int)r * (KH + 1);
++				k.w = k.units * UNIT - 1; k.h = KH;
++				x += k.units * UNIT;
++				if (k.txt) { k.txt->setX(k.x); k.txt->setY(k.y + 3); }
++			}
++		}
++	}
++
++	static void open(bool automatic, bool top)
++	{
++		build();
++		visible = true;
++		autoOpened = automatic;
++		atTop = top;
++		shift = true;
++		layout();
++	}
++
++	static void close()
++	{
++		visible = false;
++		autoOpened = false;
++		heldDir = -1;
++	}
++
++	static void toggle()
++	{
++		if (visible) close(); else open(false, false);
++	}
++
++	static void pushKey(SDLKey sym, UCode uc)
++	{
++		SDL_Event ev;
++		memset(&ev, 0, sizeof(ev));
++		ev.type = SDL_KEYDOWN;
++		ev.key.type = SDL_KEYDOWN;
++		ev.key.state = SDL_PRESSED;
++		ev.key.keysym.sym = sym;
++		ev.key.keysym.unicode = (Uint16)uc;
++		SDL_PushEvent(&ev);
++		ev.type = SDL_KEYUP;
++		ev.key.type = SDL_KEYUP;
++		ev.key.state = SDL_RELEASED;
++		SDL_PushEvent(&ev);
++	}
++
++	static void press()
++	{
++		Key &k = rows[selRow][selCol];
++		switch (k.sp)
++		{
++		case K_SHIFT: shift = !shift; break;
++		case K_SPACE: pushKey(SDLK_SPACE, ' '); break;
++		case K_LEFT: pushKey(SDLK_LEFT, 0); break;
++		case K_RIGHT: pushKey(SDLK_RIGHT, 0); break;
++		case K_DEL: pushKey(SDLK_BACKSPACE, 8); break;
++		case K_OK: pushKey(SDLK_RETURN, 13); break;
++		default:
++		{
++			UCode c = shift ? k.cUp : k.cLow;
++			SDLKey sym = SDLK_UNKNOWN;
++			UCode lc = k.cLow;
++			if (lc < 128) sym = (SDLKey)lc;
++			pushKey(sym, c);
++			shift = false; // one-shot, like a phone keyboard
++			break;
++		}
++		}
++	}
++
++	static void move(int dir)
++	{
++		if (dir == 2) selCol = (selCol + (int)rows[selRow].size() - 1) % (int)rows[selRow].size();
++		else if (dir == 3) selCol = (selCol + 1) % (int)rows[selRow].size();
++		else
++		{
++			Key &cur = rows[selRow][selCol];
++			int cx = cur.x + cur.w / 2;
++			selRow = (selRow + (dir == 0 ? (int)rows.size() - 1 : 1)) % (int)rows.size();
++			int best = 0, bestD = 1 << 30;
++			for (size_t c = 0; c < rows[selRow].size(); ++c)
++			{
++				Key &k = rows[selRow][c];
++				int d = std::abs(k.x + k.w / 2 - cx);
++				if (d < bestD) { bestD = d; best = (int)c; }
++			}
++			selCol = best;
++		}
++	}
++
++	static int dirOf(SDLKey k)
++	{
++		switch (k)
++		{
++		case SDLK_KP8: case SDLK_INSERT: return 0;
++		case SDLK_KP2: case SDLK_F6: return 1;
++		case SDLK_KP4: case SDLK_PAUSE: return 2;
++		case SDLK_KP6: case SDLK_MENU: return 3;
++		default: return -1;
++		}
++	}
++
++	/// Returns true if the event was eaten by the keyboard.
++	static bool handle(SDL_Event &ev)
++	{
++		if (!visible) return false;
++		switch (ev.type)
++		{
++		case SDL_KEYDOWN:
++		{
++			int d = dirOf(ev.key.keysym.sym);
++			if (d >= 0)
++			{
++				if (heldDir != d) { heldDir = d; heldSince = lastRep = SDL_GetTicks(); move(d); }
++				return true;
++			}
++			if (ev.key.keysym.sym == SDLK_ESCAPE) { close(); return true; }
++			return false;
++		}
++		case SDL_KEYUP:
++		{
++			int d = dirOf(ev.key.keysym.sym);
++			if (d >= 0 && d == heldDir) heldDir = -1;
++			if (ev.key.keysym.sym == SDLK_ESCAPE) return true;
++			return false; // let pad navigation see releases
++		}
++		case SDL_MOUSEBUTTONDOWN:
++			if (ev.button.button == SDL_BUTTON_LEFT) { press(); return true; }
++			if (ev.button.button == SDL_BUTTON_RIGHT) { pushKey(SDLK_BACKSPACE, 8); return true; }
++			return true;
++		case SDL_MOUSEBUTTONUP:
++			return true;
++		default:
++			return false;
++		}
++	}
++
++	static TextEdit *focusedEdit(State *state)
++	{
++		const std::vector<Surface*> &surfaces = state->getSurfaces();
++		for (std::vector<Surface*>::const_iterator i = surfaces.begin(); i != surfaces.end(); ++i)
++		{
++			TextEdit *te = dynamic_cast<TextEdit*>(*i);
++			if (te && te->getVisible() && !te->getHidden() && te->isFocused()) return te;
++		}
++		return 0;
++	}
++
++	static void think(State *state)
++	{
++		TextEdit *te = focusedEdit(state);
++		bool focused = te != 0;
++		if (focused && !wasFocused && !visible)
++		{
++			// keep the keyboard away from the field being edited
++			open(true, te->getY() + te->getHeight() / 2 > Options::baseYResolution / 2);
++		}
++		else if (!focused && wasFocused && visible && autoOpened)
++		{
++			close();
++		}
++		wasFocused = focused;
++		if (visible && heldDir >= 0)
++		{
++			Uint32 now = SDL_GetTicks();
++			if (now - heldSince > 350 && now - lastRep > 110) { lastRep = now; move(heldDir); }
++		}
++	}
++
++	static Uint8 nearest(SDL_Color *pal, int r, int g, int b)
++	{
++		int best = 0, bestD = 1 << 30;
++		for (int i = 1; i < 256; ++i)
++		{
++			int dr = pal[i].r - r, dg = pal[i].g - g, db = pal[i].b - b;
++			int d = dr * dr + dg * dg + db * db;
++			if (d < bestD) { bestD = d; best = i; }
++		}
++		return (Uint8)best;
++	}
++
++	static void blit(Surface *screen)
++	{
++		if (!visible || !game) return;
++		SDL_Color *pal = screen->getPalette();
++		if (!pal) return;
++		Uint8 cBack = nearest(pal, 0, 0, 0);
++		Uint8 cFrame = nearest(pal, 110, 110, 130);
++		Uint8 cText = nearest(pal, 225, 225, 225);
++		Uint8 cSel = nearest(pal, 230, 200, 60);
++		Uint8 cShift = nearest(pal, 120, 220, 120);
++		Font *big = game->getMod()->getFont("FONT_BIG", false), *small = game->getMod()->getFont("FONT_SMALL", false);
++		if (!small) return;
++
++		screen->lock();
++		// dithered background: every other pixel, so the game shows through
++		for (int y = originY; y < originY + totalH; ++y)
++			for (int x = originX + ((y & 1) ? 1 : 0); x < originX + totalW; x += 2)
++				screen->setPixel(x, y, cBack);
++		for (size_t r = 0; r < rows.size(); ++r)
++		{
++			for (size_t c = 0; c < rows[r].size(); ++c)
++			{
++				Key &k = rows[r][c];
++				bool sel = ((int)r == selRow && (int)c == selCol);
++				if (sel)
++				{
++					for (int y = k.y; y < k.y + k.h; ++y)
++						for (int x = k.x; x < k.x + k.w; ++x)
++							screen->setPixel(x, y, cSel);
++				}
++				else
++				{
++					// 75% dark inside keys: leave only one pixel in four see-through
++					for (int y = k.y + 1; y < k.y + k.h - 1; ++y)
++						for (int x = k.x + 1; x < k.x + k.w - 1; ++x)
++							if (!((x & 1) && (y & 1))) screen->setPixel(x, y, cBack);
++					for (int x = k.x; x < k.x + k.w; ++x) { screen->setPixel(x, k.y, cFrame); screen->setPixel(x, k.y + k.h - 1, cFrame); }
++					for (int y = k.y; y < k.y + k.h; ++y) { screen->setPixel(k.x, y, cFrame); screen->setPixel(k.x + k.w - 1, y, cFrame); }
++				}
++			}
++		}
++		screen->unlock();
++
++		// labels: render with the game font, then stamp in a single colour
++		for (size_t r = 0; r < rows.size(); ++r)
++		{
++			for (size_t c = 0; c < rows[r].size(); ++c)
++			{
++				Key &k = rows[r][c];
++				const std::string &label = shift ? k.up : k.low;
++				if (!k.txt)
++				{
++					k.txt = new Text(k.w, 9, k.x, k.y + 3);
++					k.txt->initText(big, small, game->getLanguage());
++					k.txt->setSmall();
++					k.txt->setAlign(ALIGN_CENTER);
++					k.txt->setColor(0); // raw font values: 1-2 = stroke, 3-5 = outline
++				}
++				if (k.shown != label)
++				{
++					k.shown = label;
++					k.txt->setText(label);
++				}
++				k.txt->setPalette(pal);
++				k.txt->draw();
++				bool sel = ((int)r == selRow && (int)c == selCol);
++				Uint8 col = sel ? cBack : ((k.sp == K_SHIFT && shift) ? cShift : cText);
++				k.txt->lock();
++				screen->lock();
++				for (int y = 0; y < k.txt->getHeight(); ++y)
++					for (int x = 0; x < k.txt->getWidth(); ++x)
++					{
++						Uint8 v = k.txt->getPixel(x, y);
++						if (!v) continue;
++						if (v <= 2) screen->setPixel(k.txt->getX() + x, k.txt->getY() + y, col);
++						else if (!sel) screen->setPixel(k.txt->getX() + x, k.txt->getY() + y, cBack);
++					}
++				screen->unlock();
++				k.txt->unlock();
++			}
++		}
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Pad navigation (handhelds): numpad 8/2/4/6 drive the cursor.
++// Over buttons/lists the cursor snaps to the next clickable element in that
++// direction; over big areas (globe, battlescape map, inventory...) or when
++// there is nothing in that direction it moves freely with acceleration.
++// ---------------------------------------------------------------------------
++namespace PadNav
++{
++	struct Cand { int x, y, w, h; int tx, ty; };
++
++	static bool held[4] = { false, false, false, false }; // up, down, left, right
++	static int lastDir = -1;
++	static bool freeMode = false;
++	static Uint32 pressTime = 0, lastRepeat = 0, lastThink = 0;
++	static double accX = 0.0, accY = 0.0;
++	static double freeX = 0.0, freeY = 0.0;
++	// L1/R1 arrive as PageUp/PageDown: tap = normal key, hold + d-pad = free cursor
++	static bool modHeld[2] = { false, false }, modUsed[2] = { false, false };
++	static SDL_Event modDown[2];
++	static int passthrough = 0;
++
++	static bool modActive() { return modHeld[0] || modHeld[1]; }
++	static const int DX[4] = { 0, 0, -1, 1 };
++	static const int DY[4] = { -1, 1, 0, 0 };
++
++	static int keyToDir(SDLKey k)
++	{
++		switch (k)
++		{
++		case SDLK_KP8: case SDLK_INSERT: return 0;
++		case SDLK_KP2: case SDLK_F6: return 1;
++		case SDLK_KP4: case SDLK_PAUSE: return 2;
++		case SDLK_KP6: case SDLK_MENU: return 3;
++		default: return -1;
++		}
++	}
++
++	static void calibrate();
++	static void getMouse(Screen *screen, double &gx, double &gy)
++	{
++		calibrate();
++		int mx, my;
++		SDL_GetMouseState(&mx, &my);
++		gx = (mx - screen->getCursorLeftBlackBand()) / screen->getXScale();
++		gy = (my - screen->getCursorTopBlackBand()) / screen->getYScale();
++	}
++
++	// sdl12-compat on SDL2 letterboxes the window: SDL_WarpMouse takes physical
++	// coordinates while SDL_GetMouseState reports logical ones. We learn the
++	// offset by comparing where we asked to go with where we ended up.
++	static int corrX = 0, corrY = 0;
++	static bool pending = false;
++	static int wantX = 0, wantY = 0;
++	static Uint32 warpTime = 0;
++
++	static void calibrate()
++	{
++		if (!pending || SDL_GetTicks() - warpTime < 40) return;
++		pending = false;
++		int ax, ay;
++		SDL_GetMouseState(&ax, &ay);
++		int dx = wantX - ax, dy = wantY - ay;
++		if ((dx || dy) && std::abs(dx) < 200 && std::abs(dy) < 200)
++		{
++			corrX += dx;
++			corrY += dy;
++			Log(LOG_INFO) << "[padnav] warp offset corrected by " << dx << "," << dy << " -> total " << corrX << "," << corrY;
++		}
++	}
++
++	static void warp(Screen *screen, double gx, double gy)
++	{
++		int maxX = Options::baseXResolution - 1, maxY = Options::baseYResolution - 1;
++		if (gx < 0) gx = 0; if (gy < 0) gy = 0;
++		if (gx > maxX) gx = maxX; if (gy > maxY) gy = maxY;
++		int sx = (int)(gx * screen->getXScale() + screen->getCursorLeftBlackBand() + 0.5);
++		int sy = (int)(gy * screen->getYScale() + screen->getCursorTopBlackBand() + 0.5);
++		SDL_WarpMouse(sx + corrX, sy + corrY);
++		wantX = sx; wantY = sy; pending = true; warpTime = SDL_GetTicks();
++		SDL_Event ev;
++		ev.type = SDL_MOUSEMOTION;
++		ev.motion.type = SDL_MOUSEMOTION;
++		ev.motion.state = SDL_GetMouseState(0, 0);
++		ev.motion.x = sx;
++		ev.motion.y = sy;
++		ev.motion.xrel = 0;
++		ev.motion.yrel = 0;
++		SDL_PushEvent(&ev);
++	}
++
++	static bool usable(Surface *s)
++	{
++		return s && s->getVisible() && !s->getHidden() && s->getWidth() > 0 && s->getHeight() > 0;
++	}
++
++	static bool isLarge(Surface *s)
++	{
++		double area = (double)s->getWidth() * s->getHeight();
++		return area > 0.35 * Options::baseXResolution * Options::baseYResolution;
++	}
++
++	static bool inside(const Cand &c, double px, double py)
++	{
++		return px >= c.x && px < c.x + c.w && py >= c.y && py < c.y + c.h;
++	}
++
++	static const std::list<State*> *allStates = 0;
++
++	/// Large areas (globe, map...) of every visible state, top state included.
++	static void collectLarge(std::vector<Cand> &out)
++	{
++		if (!allStates || allStates->empty()) return;
++		std::list<State*>::const_iterator i = allStates->end();
++		do { --i; } while (i != allStates->begin() && !(*i)->isScreen());
++		for (; i != allStates->end(); ++i)
++		{
++			const std::vector<Surface*> &surfaces = (*i)->getSurfaces();
++			for (std::vector<Surface*>::const_iterator j = surfaces.begin(); j != surfaces.end(); ++j)
++			{
++				InteractiveSurface *is = dynamic_cast<InteractiveSurface*>(*j);
++				if (!is || !usable(is) || dynamic_cast<TextList*>(is) || !isLarge(is)) continue;
++				Cand c = { is->getX(), is->getY(), is->getWidth(), is->getHeight(), 0, 0 };
++				out.push_back(c);
++			}
++		}
++	}
++
++	/// Collects clickable targets of the top state. Returns true if the cursor is over a large area.
++	static bool collect(State *state, double px, double py, std::vector<Cand> &out, TextList *&listUnder)
++	{
++		bool overLarge = false;
++		listUnder = 0;
++		const std::vector<Surface*> &surfaces = state->getSurfaces();
++		InteractiveSurface *modal = state->getModal();
++		for (std::vector<Surface*>::const_iterator i = surfaces.begin(); i != surfaces.end(); ++i)
++		{
++			InteractiveSurface *is = dynamic_cast<InteractiveSurface*>(*i);
++			if (!is || !usable(is)) continue;
++			if (modal && is != modal) continue;
++			TextList *list = dynamic_cast<TextList*>(is);
++			if (list)
++			{
++				for (int a = 0; a < 2; ++a)
++				{
++					const std::vector<ArrowButton*> &arrows = a ? list->getNavArrowsRight() : list->getNavArrowsLeft();
++					for (std::vector<ArrowButton*>::const_iterator j = arrows.begin(); j != arrows.end(); ++j)
++					{
++						Surface *ar = (Surface*)(*j);
++						if (!usable(ar)) continue;
++						Cand c = { ar->getX(), ar->getY(), ar->getWidth(), ar->getHeight(), ar->getX() + ar->getWidth() / 2, ar->getY() + ar->getHeight() / 2 };
++						out.push_back(c);
++					}
++				}
++				int rh = list->getNavRowHeight();
++				if (!list->isSelectable() || rh <= 0) continue;
++				if (px >= list->getX() && px < list->getX() + list->getWidth() && py >= list->getY() && py < list->getY() + list->getHeight())
++					listUnder = list;
++				size_t rows = list->getRows(), scroll = list->getNavScroll();
++				size_t vis = list->getNavVisibleRows();
++				size_t n = rows > scroll ? std::min(vis, rows - scroll) : 0;
++				int tx = (px >= list->getX() + 2 && px < list->getX() + list->getWidth() - 2) ? (int)px : list->getX() + std::min(list->getWidth() / 2, 60);
++				for (size_t k = 0; k < n; ++k)
++				{
++					int y = list->getY() + (int)k * rh;
++					if (y + rh / 2 >= list->getY() + list->getHeight()) break;
++					Cand c = { list->getX(), y, list->getWidth(), rh, tx, y + rh / 2 };
++					out.push_back(c);
++				}
++				continue;
++			}
++			if (isLarge(is))
++			{
++				if (px >= is->getX() && px < is->getX() + is->getWidth() && py >= is->getY() && py < is->getY() + is->getHeight())
++					overLarge = true;
++				continue;
++			}
++			Cand c = { is->getX(), is->getY(), is->getWidth(), is->getHeight(), is->getX() + is->getWidth() / 2, is->getY() + is->getHeight() / 2 };
++			out.push_back(c);
++		}
++		return overLarge;
++	}
++
++	/// Tries to snap in a direction. Returns false if there is nowhere to go.
++	static bool snap(State *state, Screen *screen, int dir)
++	{
++		double px, py;
++		getMouse(screen, px, py);
++		std::vector<Cand> cands;
++		TextList *listUnder = 0;
++		bool overLarge = collect(state, px, py, cands, listUnder);
++		std::vector<Cand> large;
++		collectLarge(large);
++		bool onSmall = false, nextSmall = false, nextLarge = false;
++		double qx = px + DX[dir] * 6, qy = py + DY[dir] * 6;
++		for (size_t i = 0; i < cands.size(); ++i)
++		{
++			const Cand &c = cands[i];
++			if (!inside(c, px, py)) continue;
++			onSmall = true;
++			// probe just outside the element we're on
++			if (dir == 0) qy = c.y - 4;
++			else if (dir == 1) qy = c.y + c.h + 3;
++			else if (dir == 2) qx = c.x - 4;
++			else qx = c.x + c.w + 3;
++			break;
++		}
++		for (size_t i = 0; i < cands.size(); ++i)
++			if (!inside(cands[i], px, py) && inside(cands[i], qx, qy)) nextSmall = true;
++		for (size_t i = 0; i < large.size(); ++i)
++		{
++			if (inside(large[i], px, py)) overLarge = true;
++			if (inside(large[i], qx, qy)) nextLarge = true;
++		}
++		// small targets win over big areas they sit on (e.g. battlescape buttons)
++		if (overLarge && !onSmall) return false;
++		// a big area right next to us in that direction: walk into it freely
++		if (nextLarge && !nextSmall) return false;
++
++		// scroll lists when moving past their first/last visible row
++		if (listUnder && (dir == 0 || dir == 1))
++		{
++			int rh = listUnder->getNavRowHeight();
++			size_t rows = listUnder->getRows(), scroll = listUnder->getNavScroll(), vis = listUnder->getNavVisibleRows();
++			size_t n = rows > scroll ? std::min(vis, rows - scroll) : 0;
++			int k = (int)((py - listUnder->getY()) / rh);
++			if (dir == 1 && n > 0 && k >= (int)n - 1 && scroll + vis < rows)
++			{
++				listUnder->scrollDown(false, false);
++				warp(screen, px, py);
++				return true;
++			}
++			if (dir == 0 && k <= 0 && scroll > 0)
++			{
++				listUnder->scrollUp(false, false);
++				warp(screen, px, py);
++				return true;
++			}
++		}
++
++		int best = -1;
++		double bestScore = 1e18;
++		for (size_t i = 0; i < cands.size(); ++i)
++		{
++			const Cand &c = cands[i];
++			if (inside(c, px, py)) continue;
++			// distance from the cursor to the target rectangle along / across the direction
++			double nx = std::max((double)c.x, std::min(px, (double)(c.x + c.w - 1)));
++			double ny = std::max((double)c.y, std::min(py, (double)(c.y + c.h - 1)));
++			double vx = nx - px, vy = ny - py;
++			double along = vx * DX[dir] + vy * DY[dir];
++			double across = std::fabs(vx * DY[dir] - vy * DX[dir]);
++			if (along < 1.0) continue;
++			if (across > along * 2.5 + 8) continue;
++			double score = along + across * 2.0;
++			if (score < bestScore) { bestScore = score; best = (int)i; }
++		}
++		if (best < 0) return false;
++		static int snapLogged = 0;
++		if (snapLogged++ < 20) Log(LOG_INFO) << "[padnav] snap " << px << "," << py << " -> " << cands[best].tx << "," << cands[best].ty << " (" << cands.size() << " targets)";
++		warp(screen, cands[best].tx, cands[best].ty);
++		return true;
++	}
++
++	/// Handles a numpad key event. Returns true if consumed.
++	static bool handle(State *state, Screen *screen, SDL_Event &ev)
++	{
++		if (ev.type != SDL_KEYDOWN && ev.type != SDL_KEYUP) return false;
++		SDLKey sym = ev.key.keysym.sym;
++		if (sym == SDLK_PAGEUP || sym == SDLK_PAGEDOWN)
++		{
++			if (passthrough > 0) { --passthrough; return false; }
++			int m = (sym == SDLK_PAGEUP) ? 0 : 1;
++			if (ev.type == SDL_KEYDOWN)
++			{
++				if (modHeld[m]) return true; // key repeat
++				modHeld[m] = true;
++				modUsed[m] = false;
++				modDown[m] = ev;
++				if (modHeld[1 - m])
++				{
++					// L1 + R1: on-screen keyboard
++					modUsed[0] = modUsed[1] = true;
++					OSK::toggle();
++					return true;
++				}
++				if (lastDir >= 0 && held[lastDir])
++				{
++					modUsed[m] = true;
++					freeMode = true;
++					getMouse(screen, freeX, freeY);
++					lastThink = SDL_GetTicks();
++				}
++			}
++			else
++			{
++				modHeld[m] = false;
++				if (!modUsed[m])
++				{
++					// plain tap: replay it for the game
++					SDL_Event up = ev;
++					passthrough += 2;
++					SDL_PushEvent(&modDown[m]);
++					SDL_PushEvent(&up);
++				}
++				else if (!modActive() && lastDir >= 0 && held[lastDir])
++				{
++					// back to button-to-button
++					freeMode = false;
++					pressTime = lastRepeat = SDL_GetTicks();
++				}
++			}
++			return true;
++		}
++		int dir = keyToDir(sym);
++		static int logged = 0;
++		if (ev.type == SDL_KEYDOWN && logged < 40)
++		{
++			++logged;
++			Log(LOG_INFO) << "[padnav] key " << (int)ev.key.keysym.sym << " (" << SDL_GetKeyName(ev.key.keysym.sym) << ") dir=" << dir;
++		}
++		if (dir < 0) return false;
++		if (ev.type == SDL_KEYUP)
++		{
++			held[dir] = false;
++			if (dir == lastDir) { lastDir = -1; freeMode = false; }
++			return true;
++		}
++		if (held[dir]) return true; // key repeat, handled in think()
++		held[dir] = true;
++		lastDir = dir;
++		pressTime = lastRepeat = lastThink = SDL_GetTicks();
++		accX = accY = 0.0;
++		if (modActive())
++		{
++			modUsed[0] = modUsed[0] || modHeld[0];
++			modUsed[1] = modUsed[1] || modHeld[1];
++			freeMode = true;
++		}
++		else
++		{
++			freeMode = !snap(state, screen, dir);
++		}
++		if (freeMode) getMouse(screen, freeX, freeY);
++		return true;
++	}
++
++	/// Called every loop: auto-repeat snapping, free cursor movement.
++	static void think(State *state, Screen *screen)
++	{
++		Uint32 now = SDL_GetTicks();
++		if (lastDir < 0 || !held[lastDir]) { lastThink = now; return; }
++		Uint32 heldFor = now - pressTime;
++		if (!freeMode)
++		{
++			if (heldFor > 350 && now - lastRepeat > 130)
++			{
++				lastRepeat = now;
++				if (!snap(state, screen, lastDir))
++				{
++					freeMode = true;
++					lastThink = now;
++					getMouse(screen, freeX, freeY);
++				}
++			}
++			return;
++		}
++		Uint32 dt = now - lastThink;
++		if (dt < 10) return;
++		lastThink = now;
++		if (dt > 50) dt = 50;
++		// game pixels per millisecond, accelerating while held
++		double speed = std::min(0.04 + heldFor * 0.00025, 0.30);
++		double mx = 0, my = 0;
++		for (int d = 0; d < 4; ++d)
++			if (held[d]) { mx += DX[d]; my += DY[d]; }
++		accX += mx * speed * dt;
++		accY += my * speed * dt;
++		int ix = (int)accX, iy = (int)accY;
++		if (ix == 0 && iy == 0) return;
++		accX -= ix; accY -= iy;
++		freeX = std::max(0.0, std::min(freeX + ix, (double)(Options::baseXResolution - 1)));
++		freeY = std::max(0.0, std::min(freeY + iy, (double)(Options::baseYResolution - 1)));
++		warp(screen, freeX, freeY);
++	}
++}
++
+ void Game::run()
+ {
+ 	enum ApplicationState { RUNNING = 0, SLOWED = 1, PAUSED = 2 } runningState = RUNNING;
+@@ -251,6 +984,8 @@ void Game::run()
+ 					runningState = RUNNING;
+ 					// Go on, feed the event to others
+ 				default:
++					if (OSK::handle(_event)) break;
++					if (!_states.empty() && (PadNav::allStates = &_states) && PadNav::handle(_states.back(), _screen, _event)) break;
+ 					Action action = Action(&_event, _screen->getXScale(), _screen->getYScale(), _screen->getCursorTopBlackBand(), _screen->getCursorLeftBlackBand());
+ 					_screen->handle(&action);
+ 					_cursor->handle(&action);
+@@ -292,6 +1027,10 @@ void Game::run()
+ 		if (runningState != PAUSED)
+ 		{
+ 			// Process logic
++			PadNav::allStates = &_states;
++			OSK::game = this;
++			OSK::think(_states.back());
++			PadNav::think(_states.back(), _screen);
+ 			_states.back()->think();
+ 			_fpsCounter->think();
+ 			if (Options::FPS > 0 && !(Options::useOpenGL && Options::vSyncForOpenGL))
+@@ -323,6 +1062,7 @@ void Game::run()
+ 				{
+ 					(*i)->blit();
+ 				}
++				OSK::blit(_screen->getSurface());
+ 				_fpsCounter->blit(_screen->getSurface());
+ 				_cursor->blit(_screen->getSurface());
+ 				_screen->flip();
+diff --git a/src/Engine/State.h b/src/Engine/State.h
+index 82e7de6d4..ae92fe227 100644
+--- a/src/Engine/State.h
++++ b/src/Engine/State.h
+@@ -112,6 +112,10 @@ public:
+ 	virtual void resize(int &dX, int &dY);
+ 	/// Re-orients all the surfaces in the state.
+ 	virtual void recenter(int dX, int dY);
++	/// Gets the state's child elements (pad navigation).
++	const std::vector<Surface*> &getSurfaces() const { return _surfaces; }
++	/// Gets the modal surface, if any (pad navigation).
++	InteractiveSurface *getModal() const { return _modal; }
+ };
+ 
+ }
+diff --git a/src/Engine/Surface.h b/src/Engine/Surface.h
+index 95dd39c36..10992661e 100644
+--- a/src/Engine/Surface.h
++++ b/src/Engine/Surface.h
+@@ -135,6 +135,8 @@ public:
+ 	virtual void setVisible(bool visible);
+ 	/// Gets the surface's visibility.
+ 	bool getVisible() const;
++	/// Gets whether the surface is hidden.
++	bool getHidden() const { return _hidden; }
+ 	/// Resets the cropping rectangle for the surface.
+ 	void resetCrop();
+ 	/// Gets the cropping rectangle for the surface.
+diff --git a/src/Interface/TextList.cpp b/src/Interface/TextList.cpp
+index dd720a7a8..b7c4e686e 100644
+--- a/src/Interface/TextList.cpp
++++ b/src/Interface/TextList.cpp
+@@ -246,6 +246,11 @@ size_t TextList::getTexts() const
+  * Returns the amount of physical rows stored in the list.
+  * @return Number of rows.
+  */
++int TextList::getNavRowHeight() const
++{
++	return _font ? _font->getHeight() + _font->getSpacing() : 0;
++}
++
+ size_t TextList::getRows() const
+ {
+ 	return _rows.size();
+diff --git a/src/Interface/TextList.h b/src/Interface/TextList.h
+index 10df32c1d..46ccfc2c1 100644
+--- a/src/Interface/TextList.h
++++ b/src/Interface/TextList.h
+@@ -99,6 +99,13 @@ public:
+ 	size_t getTexts() const;
+ 	/// Gets the amount of rows in the list.
+ 	size_t getRows() const;
++	/// Pad navigation helpers.
++	bool isSelectable() const { return _selectable; }
++	int getNavRowHeight() const;
++	size_t getNavScroll() const { return _scroll; }
++	size_t getNavVisibleRows() const { return _visibleRows; }
++	const std::vector<ArrowButton*> &getNavArrowsLeft() const { return _arrowLeft; }
++	const std::vector<ArrowButton*> &getNavArrowsRight() const { return _arrowRight; }
+ 	/// Gets the amount of visible rows in the list.
+ 	size_t getVisibleRows() const;
+ 	/// Adds a new row to the text list.
+diff --git a/src/main.cpp b/src/main.cpp
+index 4147ff8ce..d1335d9d8 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -23,6 +23,9 @@
+ #include "Engine/Game.h"
+ #include "Engine/Options.h"
+ #include "Menu/StartState.h"
++#include <SDL.h>
++#include <SDL_image.h>
++#include <cstring>
+ 
+ /** @mainpage
+  * @author OpenXcom Developers
+@@ -85,6 +88,97 @@ Game *game = 0;
+ 
+ // If you can't tell what the main() is for you should have your
+ // programming license revoked...
++
++/**
++ * Personal splash ("Allahu Corp") shown before the game starts.
++ * Looks for splash.png in the working folder or the data folder.
++ * Fades in/out through the 8-bit palette; any key or button skips it.
++ */
++static void showSplash()
++{
++	SDL_Surface *img = IMG_Load("splash.png");
++	if (!img) img = IMG_Load((Options::getDataFolder() + "splash.png").c_str());
++	if (!img) return;
++	SDL_Surface *disp = SDL_GetVideoSurface();
++	if (!disp) { SDL_FreeSurface(img); return; }
++	bool paletted = disp->format->BitsPerPixel == 8 && img->format->palette;
++	SDL_Color base[256];
++	memset(base, 0, sizeof(base));
++	if (paletted)
++	{
++		for (int i = 0; i < img->format->palette->ncolors && i < 256; ++i) base[i] = img->format->palette->colors[i];
++		SDL_Color black[256];
++		memset(black, 0, sizeof(black));
++		SDL_SetPalette(disp, SDL_LOGPAL | SDL_PHYSPAL, black, 0, 256);
++	}
++	SDL_FillRect(disp, 0, 0);
++	SDL_Rect dst;
++	dst.x = (Sint16)((disp->w - img->w) / 2);
++	dst.y = (Sint16)((disp->h - img->h) / 2);
++	if (paletted)
++	{
++		// same palette on both sides: copy raw indices
++		SDL_SetPalette(img, SDL_LOGPAL, base, 0, 256);
++		SDL_LockSurface(disp);
++		for (int y = 0; y < img->h; ++y)
++		{
++			int dy = dst.y + y;
++			if (dy < 0 || dy >= disp->h) continue;
++			Uint8 *srow = (Uint8*)img->pixels + y * img->pitch;
++			Uint8 *drow = (Uint8*)disp->pixels + dy * disp->pitch;
++			for (int x = 0; x < img->w; ++x)
++			{
++				int dx = dst.x + x;
++				if (dx >= 0 && dx < disp->w) drow[dx] = srow[x];
++			}
++		}
++		SDL_UnlockSurface(disp);
++	}
++	else
++	{
++		SDL_BlitSurface(img, 0, disp, &dst);
++	}
++	const Uint32 fadeIn = 500, total = 3200, fadeOut = 500;
++	Uint32 start = SDL_GetTicks();
++	bool skip = false;
++	while (true)
++	{
++		Uint32 t = SDL_GetTicks() - start;
++		SDL_Event ev;
++		while (SDL_PollEvent(&ev))
++		{
++			if (ev.type == SDL_KEYDOWN || ev.type == SDL_MOUSEBUTTONDOWN || ev.type == SDL_JOYBUTTONDOWN || ev.type == SDL_QUIT)
++			{
++				if (!skip && t < total - fadeOut) { skip = true; start = SDL_GetTicks() - (total - fadeOut); t = total - fadeOut; }
++			}
++		}
++		if (t >= total) break;
++		if (paletted)
++		{
++			double k = 1.0;
++			if (t < fadeIn) k = (double)t / fadeIn;
++			else if (t > total - fadeOut) k = (double)(total - t) / fadeOut;
++			SDL_Color cur[256];
++			for (int i = 0; i < 256; ++i)
++			{
++				cur[i].r = (Uint8)(base[i].r * k);
++				cur[i].g = (Uint8)(base[i].g * k);
++				cur[i].b = (Uint8)(base[i].b * k);
++				cur[i].unused = 0;
++			}
++			SDL_SetPalette(disp, SDL_LOGPAL | SDL_PHYSPAL, cur, 0, 256);
++		}
++		SDL_Flip(disp);
++		SDL_Delay(15);
++	}
++	SDL_FillRect(disp, 0, 0);
++	SDL_Flip(disp);
++	SDL_FreeSurface(img);
++	// drop any input that arrived during the splash
++	SDL_Event ev;
++	while (SDL_PollEvent(&ev)) {}
++}
++
+ int main(int argc, char *argv[])
+ {
+ #ifdef _MSC_VER
+@@ -117,6 +211,7 @@ int main(int argc, char *argv[])
+ 
+ 	game = new Game(title.str());
+ 	State::setGamePtr(game);
++	showSplash();
+ 	game->setState(new StartState);
+ 	game->run();
+ 

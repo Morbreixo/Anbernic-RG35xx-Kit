@@ -1,0 +1,22 @@
+# gptokeyb (versión ANTIGUA de christianhaitian, la que trae la consola).
+# Nombres válidos en plantillas/gptokeyb-teclas.txt. NO admite numpad*, f11, f12.
+back = tab
+start = esc
+a = mouse_left
+b = mouse_right
+x = enter
+y = space
+l1 = pageup
+r1 = pagedown
+l2 = left
+r2 = right
+# Ratón con la cruceta (la RG35XX original no tiene sticks):
+up = mouse_movement_up
+down = mouse_movement_down
+left = mouse_movement_left
+right = mouse_movement_right
+mouse_scale = 512
+mouse_delay = 16
+# Otras opciones que acepta esta versión (vistas en el port de Heroes 2):
+#   guide = esc            l1 = repeat (repetir mientras se mantiene)
+#   dpad_mouse_step = 5    repeat_interval = 10
